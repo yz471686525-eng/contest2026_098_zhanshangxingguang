@@ -31,6 +31,13 @@ manifest 指向 08-11,官方工具报成功却只复制了 31 事件那份,丢�
 
 按日期升序处理,使同一会话的 manifest 条目最终指向最后一天(与官方行为一致)。
 
+与 contest-log-collector-multiday.patch 的关系
+---------------------------------------------
+同目录下的 `contest-log-collector-multiday.patch` 是给官方工具的**根治补丁**,
+已实测两者产出的 manifest 与文件完全等价。若组委会接受该补丁(或你在本地打上
+它),`contest-snapshot --all --confirm` 就能直接导全,本脚本即可不再需要。
+在此之前,用本脚本。
+
 用法
 ----
     python3 docs/velapet/tools/sync_contest_logs.py            # 同步

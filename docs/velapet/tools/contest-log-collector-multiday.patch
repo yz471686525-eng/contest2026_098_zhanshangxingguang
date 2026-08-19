@@ -1,0 +1,172 @@
+Fix multi-day session log loss in contest-log-collector
+
+Target: contest-log-collector skill, tools/export-session.py
+Tested against: claude-code-collector@1.2.0, manifest schema_version 1.0
+Reported by: team contest2026_098_zhanshangxingguang, 2026-08-19
+
+Problem
+-------
+copy_session() resolves the staging source file from the manifest entry's
+file_path, which records a single date.  Staging files a session under the
+calendar day its events occurred, so a session running past midnight has one
+file per day:
+
+    <staging>/<login>/2026-08-17/claude-code__<sid>.jsonl
+    <staging>/<login>/2026-08-18/claude-code__<sid>.jsonl
+
+Because the manifest holds only one of those dates, and because copy_session()
+copies at most one file, two distinct failures occur:
+
+  A. The recorded date matches no staging file.  The tool prints
+     "source jsonl not found" and returns rc=1.  Visible, but the wording
+     suggests the session was never captured, when the file is in fact sitting
+     in staging under a different date.
+
+  B. The recorded date matches one of several files.  Only that day is
+     exported; the remaining days are dropped while the tool reports success
+     and returns rc=0.  This case is silent.
+
+Measured on one team's staging area on 2026-08-19: 8 of 14 sessions affected.
+Seven hit case A.  One hit case B -- session 2911cf58 has 478 events on
+2026-08-10 and 31 on 2026-08-11; the manifest pointed at 08-11, so the tool
+reported success while dropping 478 of the session's 509 events.
+
+The loss is not detectable by validate-log.py.  Running the unpatched tool with
+`--all --confirm` into a clean destination exports 7 of 19 per-day files and
+316 of 12852 events -- 2.5% of the captured content -- and validate-log.py then
+reports "ALL OK" with zero errors and zero warnings, because the manifest it
+wrote and the files it copied are mutually consistent.  A team following the
+documented workflow exactly would submit 2.5% of its logs and see a green
+check.
+
+After the patch, the same command exports all 19 files, byte-identical to
+staging, and validate-log.py reports 0 errors.
+
+Fix
+---
+Resolve sources by globbing on the session id instead of trusting the recorded
+date, and copy every matching file.  This makes export independent of how the
+manifest happens to date a session.
+
+Deliberately NOT changed
+------------------------
+event_count stays scoped to the single file that file_path points at, because
+validate-log.py enforces `event_count == line count of the file at file_path`.
+Setting it to the session total across days makes the validator fail with
+"event_count mismatch" (verified).  Note that staging's own manifest uses
+session totals for the same field, so the two sides of the tooling disagree on
+its meaning -- worth reconciling separately.
+
+The earlier-day files of a multi-day session therefore remain unreferenced by
+the manifest, which validate-log.py reports as "orphan file" warnings (5 of
+them in the case above).  The data is present and complete; only the
+cross-reference is missing.  Representing a multi-day session properly needs a
+schema change, e.g. a list of files per session entry, which this patch does
+not attempt.
+
+Apply and verify
+----------------
+Run from the skill root (the directory containing tools/):
+
+    patch -p1 < contest-log-collector-multiday.patch
+
+Verify against staging without touching a real repo:
+
+    mkdir -p /tmp/verify/logs
+    python3 tools/export-session.py --all --confirm --dest /tmp/verify
+    diff -r <staging>/<login> /tmp/verify/logs/<login> \
+         --exclude=manifest.json --exclude=errors
+    python3 tools/validate-log.py /tmp/verify/logs
+
+Expected: diff reports no differences, validator reports 0 errors.  The
+validator will report one "orphan file" warning per extra day of every
+multi-day session; see "Deliberately NOT changed" above.
+
+--- a/tools/export-session.py
++++ b/tools/export-session.py
+@@ -137,35 +137,65 @@
+     return []
+ 
+ 
++def find_session_sources(src_root: Path, session_id: str) -> list[Path]:
++    """Return every staging file belonging to one session, oldest day first.
++
++    Staging stores a session under the calendar day its events occurred, so a
++    session that runs past midnight has one file per day:
++
++        <staging>/<login>/2026-08-17/claude-code__<sid>.jsonl
++        <staging>/<login>/2026-08-18/claude-code__<sid>.jsonl
++
++    The manifest entry records only a single file_path, so resolving the source
++    from that path finds at most one day and silently drops the rest.  Matching
++    on the session id instead is independent of any recorded date.
++    """
++    return sorted(src_root.glob(f"*/*__{session_id}.jsonl"),
++                  key=lambda p: (p.parent.name, p.name))
++
++
+ def copy_session(s: dict, dest_repo: Path, dry_run: bool) -> tuple[bool, str]:
+     src_root = staging_root() / s["github_login"]
+-    src_jsonl = src_root / s["file_path"].split(f"{s['github_login']}/", 1)[-1] \
+-        if "logs/" in s["file_path"] else None
+-    if src_jsonl is None or not src_jsonl.exists():
+-        date_part, fname = None, None
+-        if s["file_path"].count("/") >= 2:
+-            parts = s["file_path"].split("/")
+-            date_part, fname = parts[-2], parts[-1]
+-        if date_part and fname:
+-            src_jsonl = src_root / date_part / fname
+-    if not src_jsonl or not src_jsonl.exists():
+-        return False, f"source jsonl not found for session {s['session_id']}"
++    sources = find_session_sources(src_root, s["session_id"])
++    if not sources:
++        return False, f"no staging file found for session {s['session_id']}"
+ 
+-    rel_inside = src_jsonl.relative_to(src_root)
+-    dest_jsonl = dest_repo / "logs" / s["github_login"] / rel_inside
++    rel_paths = [p.relative_to(src_root) for p in sources]
+ 
+     if dry_run:
+-        return True, f"[dry-run] would copy {src_jsonl} -> {dest_jsonl}"
++        listed = ", ".join(str(r) for r in rel_paths)
++        return True, f"[dry-run] would copy {len(sources)} file(s): {listed}"
+ 
+-    dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
+-    shutil.copy2(src_jsonl, dest_jsonl)
++    counts = []
++    for src_jsonl, rel_inside in zip(sources, rel_paths):
++        dest_jsonl = dest_repo / "logs" / s["github_login"] / rel_inside
++        dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(src_jsonl, dest_jsonl)
++        counts.append(sum(1 for line
++                          in dest_jsonl.read_text(encoding="utf-8").splitlines()
++                          if line.strip()))
++
++    # The manifest carries one entry per session, and validate-log.py requires
++    # event_count to equal the line count of the file at file_path.  So point
++    # file_path at the session's final day and keep event_count scoped to that
++    # same file.  The earlier days are exported too; they are simply not
++    # cross-referenced by the manifest, which validate-log.py reports as an
++    # "orphan file" warning.  Representing a multi-day session properly would
++    # need a schema change (a list of files per session), which this fix
++    # deliberately does not attempt.
+ 
+-    actual_count = sum(1 for line in dest_jsonl.read_text(encoding="utf-8").splitlines() if line.strip())
+-    s["event_count"] = actual_count
+-    s["file_path"] = f"logs/{s['github_login']}/{rel_inside}"
++    s["event_count"] = counts[-1]
++    s["file_path"] = f"logs/{s['github_login']}/{rel_paths[-1]}"
+ 
+     update_dest_manifest(s, dest_repo)
+-    return True, f"copied -> {dest_jsonl.relative_to(dest_repo)} ({actual_count} events)"
++
++    if len(sources) == 1:
++        return True, f"copied -> logs/{s['github_login']}/{rel_paths[0]} " \
++                     f"({counts[0]} events)"
++
++    days = ", ".join(f"{r.parent}({c})" for r, c in zip(rel_paths, counts))
++    return True, f"copied {len(sources)} files: {days} " \
++                 f"= {sum(counts)} events, manifest -> {rel_paths[-1].parent}"
+ 
+ 
+ def update_dest_manifest(s: dict, dest_repo: Path) -> None:
