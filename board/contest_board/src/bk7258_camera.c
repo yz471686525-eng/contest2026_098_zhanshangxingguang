@@ -22,7 +22,7 @@
  * GC2145 Phase 1 - DVP IO + sensor init + PSRAM framebuf
  *
  * Phase 0: "camera id" - reads GC2145 chip ID via SCCB bit-bang
- * Phase 1: DVP data pin mux (P29-P39), GC2145 YUYV init, PSRAM buffer
+ * Phase 1: DVP data pin mux (P29-P39), GC2145 init, PSRAM buffer
  *
  * BK7258 GPIO CFG register (per-pin, at AON_GPIO_BASE + pin*4):
  *   bit[0]   gpio_input     (RO) - reads pin level
@@ -44,7 +44,7 @@
  * GC2145 init table:
  *   Ported from ARMino dvp_gc2145.c (Apache-2.0, Galois Inc)
  *   Output format: reg 0x84 = 0x02, 640x480
- *   Actual PSRAM byte order: UYVY (verified by camera dump)
+ *   Actual PSRAM byte order: VYUY (V Y0 U Y1, color-target verified)
  *
  ****************************************************************************/
 
@@ -53,9 +53,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <debug.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <nuttx/arch.h>
 #include <nuttx/clock.h>
@@ -88,7 +91,9 @@
 
 #define YUV_BUF_CTRL_YUV_MODE     (1u << 0)   /* bit[0]: 1=YUV buf mode */
 #define YUV_BUF_CTRL_FMT_SEL_MASK 0x6u        /* bit[2:1]: YUV format */
-#define YUV_BUF_CTRL_FMT_YUYV     (0u << 1)   /* 00=YUYV */
+#define YUV_BUF_CTRL_FMT_YUYV     (0u << 1)   /* 00=YUYV (HW label;
+                                                  actual PSRAM byte order
+                                                  with GC2145 is VYUY) */
 #define YUV_BUF_CTRL_FMT_UYVY     (1u << 1)   /* 01=UYVY */
 #define YUV_BUF_CTRL_FMT_YYUV     (2u << 1)   /* 10=YYUV */
 #define YUV_BUF_CTRL_FMT_UVYY     (3u << 1)   /* 11=UVYY */
@@ -192,6 +197,67 @@
 
 #define CAMERA_GPIO_MAX           55
 
+/* Skin-tone detection thresholds (Cr/Cb domain).
+ *
+ * Calibration data (2026-08-21, 20 frames each, 4800 samples/frame,
+ * zoom range [80,208]):
+ *
+ *                  Face      White wall   Wood photo
+ *   Cr >= 154     29.2%      0.30%        5.95%
+ *   Cr >= 158     18.6%      0.00%        1.29%   <- selected
+ *   Cr >= 162     10.8%      0.00%        0.17%
+ *
+ * Cb has no discriminative power (face mean 93.3 / wall 89.7, nearly
+ * identical distributions) and drifts 30-50 levels across sessions,
+ * so it is used only as a loose gate.  Y < 50 renders chrominance
+ * unreliable (occlusion test: 98% of samples collapse to neutral).
+ */
+
+#define SKIN_Y_LO    50    /* below this, chrominance is noise */
+#define SKIN_Y_HI    230   /* above this, likely saturated */
+#define SKIN_CB_LO   40    /* loose Cb gate (no discriminative power) */
+#define SKIN_CB_HI   150
+#define SKIN_CR_LO   152   /* skin vs wood-board separation, empirical
+                            * (per-surface uvhist, zoom 96..176):
+                            *   white wall  : Cr <= 138
+                            *   wood board  : Cr mass <= 149, tail to ~154,
+                            *                 but < 25 samples >= 152
+                            *   frontal face: ~670 samples in Cr 152..165
+                            * WB is low-saturation so skin and wood overlap
+                            * below 150; they only separate in the skin
+                            * tail.  152 + DETECT_MIN_HITS(96) keeps wood
+                            * under the detection floor while a frontal
+                            * face clears it ~7x.  (142 was wrong: wood
+                            * has ~1376 samples >= 142.) */
+#define SKIN_CR_HI   200
+#define SKIN_CR_CEIL 166   /* face Cr tops ~164; orange wires >=175
+                             * are non-skin red, clamp them here */
+
+/* Adaptive skin threshold (demo scene has no wood, lighting is
+ * uncontrolled).  The neutral background Cr peak is stable ~127
+ * across all captures; skin is always the reddish tail above it.
+ * Threshold = background_Cr_mode + margin, clamped.  This tracks
+ * lighting/white-balance drift instead of using a fixed value.
+ */
+#define SKIN_CR_MARGIN  16   /* skin sits >= this above neutral peak */
+#define SKIN_CR_LO_MIN  140  /* floor: neutral wall topped out at 138 */
+#define SKIN_CR_LO_MAX  156  /* ceiling: skin tops ~167, cap prevents
+                              * adaptive threshold from killing face */
+
+/* Minimum hit count to report a direction.
+ * Empty scenes test 0-29 hits; 60 rejects those while
+ * recovering face frames in the 60-95 range that the
+ * previous 96 threshold missed during motion.
+ */
+
+#define DETECT_MIN_HITS_PER_FRAME  60
+
+/* Sampling grid: identical to uvhist */
+
+#define DETECT_SAMPLES_X   80   /* every 4th VYUY group across 320 */
+#define DETECT_SAMPLES_Y   60   /* every 8th row across 480 */
+#define DETECT_TOTAL       (DETECT_SAMPLES_X * DETECT_SAMPLES_Y)
+
 /* GC2145 chip ID */
 
 #define GC2145_REG_ID_H    0xf0
@@ -240,11 +306,11 @@
 #define DVP_PIN_LAST    39
 #define DVP_PIN_COUNT   (DVP_PIN_LAST - DVP_PIN_FIRST + 1)
 
-/* Frame buffer parameters - YUYV 640x480 */
+/* Frame buffer parameters - 640x480, 2 bytes/pixel (VYUY) */
 
 #define CAMERA_HRES       640
 #define CAMERA_VRES       480
-#define CAMERA_BPP        2   /* YUYV = 2 bytes per pixel */
+#define CAMERA_BPP        2   /* 2 bytes per pixel (VYUY) */
 #define CAMERA_FRAME_SIZE (CAMERA_HRES * CAMERA_VRES * CAMERA_BPP)
 #define CAMERA_PSRAM_BASE 0x60000000u
 #define CAMERA_BUF_COUNT  2
@@ -316,6 +382,9 @@ extern void bk7258_lcd_blit_rgb565(int panel,
                                     uint16_t x0, uint16_t y0,
                                     uint16_t w, uint16_t h,
                                     const uint8_t *rgb565);
+extern void bk7258_lcd_eye_draw(int panel, int gaze_dx);
+extern void bk7258_lcd_eye_gaze(int panel,
+                                 int old_dx, int new_dx);
 
 /* DVP controller state - saved before dvp_ctrl_config(), restored by
  * dvp_ctrl_deconfig().  Only field-level RMW on shared registers.
@@ -342,11 +411,11 @@ static volatile uint32_t g_dvp_hsync_count = 0;  /* not used yet, reserved */
 static volatile uint32_t g_dvp_frame_count = 0;
 
 /****************************************************************************
- * GC2145 Init Table (YUYV 640x480)
+ * GC2145 Init Table (640x480)
  *
  * Ported from ARMino dvp_gc2145.c (Apache-2.0, Galois Inc).
- * Output format: register 0x84 = 0x02.
- * Actual PSRAM byte order: UYVY (verified by camera dump).
+ * Output format: register 0x84 = 0x02 (ARMino calls this "yuyv").
+ * Actual PSRAM byte order: VYUY (V Y0 U Y1, color-target verified).
  * Frame rate section (#if 0) excluded; drive strength included.
  ****************************************************************************/
 
@@ -399,7 +468,7 @@ static const uint8_t gc2145_init[][2] =
   {0x81, 0x26},
   {0x82, 0xfa},
   {0x83, 0x00},
-  {0x84, 0x02},  /* output format (PSRAM byte order = UYVY) */
+  {0x84, 0x02},  /* output format (PSRAM byte order = VYUY) */
   {0x86, 0x03},
   {0x88, 0x03},
   {0x89, 0x03},
@@ -1418,14 +1487,14 @@ static void mclk_enable_24mhz(void)
   val &= ~(CAMERA_P27_FUNC_MASK << CAMERA_P27_FUNC_SHIFT);
   putreg32(val, CAMERA_GPIO_FUNC_REG);
 
-  /* 3. Remap P27 → CIS AUXS clock (ARMino: gpio_dev_map) */
+  /* 3. Remap P27 -> CIS AUXS clock (ARMino: gpio_dev_map) */
 
   val = getreg32(CAMERA_GPIO_FUNC_REG);
   val |= (CAMERA_P27_FUNC_CIS_CLK << CAMERA_P27_FUNC_SHIFT);
   putreg32(val, CAMERA_GPIO_FUNC_REG);
 
   /* 4. Prep P27 GPIO: disable output/input/pull before switching function
-   *    (ARMino: gpio_hal_func_map → gpio_hal_set_pull/ output_dis / input_dis)
+   *    (ARMino: gpio_hal_func_map -> gpio_hal_set_pull/ output_dis / input_dis)
    *    Saved in mclk_save_state(), restored in mclk_restore_state().
    */
 
@@ -1482,11 +1551,11 @@ static void camera_power_on(gpio_state_t *pwr_saved, bool *pwr_ok,
       *pwdn_ok = true;
 
 #ifdef CONFIG_CAMERA_PWDNB_ACTIVE_HIGH
-      /* high=standby → drive LOW to exit standby */
+      /* high=standby -> drive LOW to exit standby */
 
       gpio_drive_low(g_cam_pwdn_pin);
 #else
-      /* low=standby → drive HIGH to exit standby */
+      /* low=standby -> drive HIGH to exit standby */
 
       gpio_set_output_high(g_cam_pwdn_pin);
 #endif
@@ -1610,7 +1679,7 @@ static int gc2145_write_table(const uint8_t (*table)[2], int count)
  * PSRAM Frame Buffer
  *
  * Allocate two ping-pong frame buffers in PSRAM at 0x60000000.
- * Each buffer is 640 * 480 * 2 = 614400 bytes (YUYV).
+ * Each buffer is 640 * 480 * 2 = 614400 bytes (VYUY).
  ****************************************************************************/
 
 static int camera_framebuf_alloc(void)
@@ -1793,7 +1862,7 @@ static void dvp_module_clk_disable(void)
  * to external memory via its internal DMA.  Configuration steps:
  *   1. Save all register values for restore
  *   2. Set resolution (x_pixel = width/8, y_pixel = height/8)
- *   3. Set format (YUV mode, YUYV)
+ *   3. Set format (YUV mode, HW label "YUYV" — actual byte order VYUY)
  *   4. Set polarity (HSYNC/VSYNC/PCLK from Kconfig)
  *   5. Set frame buffer base address
  *   6. Start YUV mode (set yuv_mode bit in CTRL)
@@ -1837,7 +1906,7 @@ static void dvp_ctrl_restore_state(const dvp_ctrl_state_t *s)
  * Description:
  *   Configure the CIS controller (YUV_BUF) for DVP capture.
  *   Resolution: CAMERA_HRES x CAMERA_VRES (640x480).
- *   Format: YUV mode, YUYV (matches GC2145 output).
+ *   Format: YUV mode, HW label "YUYV" (actual PSRAM byte order: VYUY).
  *   Polarity: from Kconfig (CONFIG_DVP_PCLK_RISING, etc.).
  *
  *   The controller's internal DMA writes captured data to the address
@@ -1899,9 +1968,9 @@ static int dvp_ctrl_config(uint32_t em_base)
   val |= YUV_BUF_CTRL_YUV_MODE;
 
   /* Set YUV format to YUYV (controller default).
-   * NOTE: actual byte order in PSRAM is UYVY (verified by camera dump).
+   * NOTE: actual byte order in PSRAM is VYUY: [V Y0 U Y1], Cr first.
    * The controller format field does NOT reorder bytes - it matches
-   * whatever the sensor outputs.  Software conversion uses UYVY parsing.
+   * whatever the sensor outputs.  Software conversion uses VYUY parsing.
    */
 
   val &= ~YUV_BUF_CTRL_FMT_SEL_MASK;
@@ -2576,7 +2645,7 @@ cleanup:
 /****************************************************************************
  * Name: bk7258_camera_init
  *   Phase 1 Step 2: power on, MCLK, reset, read ID, write GC2145 init
- *   table (YUYV 640x480), readback verify, keep MCLK/power on for
+ *   table (640x480), readback verify, keep MCLK/power on for
  *   oscilloscope verification.
  ****************************************************************************/
 
@@ -2688,7 +2757,7 @@ int bk7258_camera_init(void)
     if (val84 != 0x02)
       {
         syslog(LOG_ERR,
-               "[camera] Reg 0x84 mismatch: 0x%02X (expected 0x02=YUYV)\n",
+               "[camera] Reg 0x84 mismatch: 0x%02X (expected 0x02)\n",
                val84);
         ret = -EIO;
         goto cleanup;
@@ -2714,7 +2783,7 @@ int bk7258_camera_init(void)
   }
 
   syslog(LOG_INFO,
-         "[camera] GC2145 init complete - YUYV 640x480\n");
+         "[camera] GC2145 init complete - 640x480 VYUY\n");
   syslog(LOG_INFO,
          "[camera] MCLK/power left ON for oscilloscope verification\n");
 
@@ -3101,11 +3170,11 @@ int bk7258_camera_grab(void)
          (unsigned long)g_dvp_frame_count);
 
   /* Hexdump first 256 bytes of captured frame.
-   * Byte order: UYVY (U=b0 Y0=b1 V=b2 Y1=b3, verified by camera dump).
+   * Byte order: VYUY (Cr=b0 Y0=b1 Cb=b2 Y1=b3, verified with red/blue).
    * In neutral scenes: even bytes (U/V) ≈ 0x80, odd bytes (Y) vary.
    */
 
-  syslog(LOG_INFO, "[camera] First 256 bytes of captured frame (UYVY):\n");
+  syslog(LOG_INFO, "[camera] First 256 bytes of captured frame (VYUY):\n");
 
   for (i = 0; i < 256; i += 16)
     {
@@ -3293,21 +3362,26 @@ cleanup_ctrl:
 }
 
 /****************************************************************************
- * UYVY → RGB565 scaled conversion
+ * VYUY -> RGB565 scaled conversion
  *
- * GC2145 (reg 0x84 = 0x02) + BK7258 YUV_BUF (CTRL FMT=00) combination
- * produces UYVY byte order in PSRAM, verified by camera dump:
- *   byte0=U (~0x80 neutral), byte1=Y (luminance), byte2=V, byte3=Y
+ * GC2145 (reg 0x84 = 0x02) produces VYUY byte order in PSRAM:
+ *   byte0=Cr(V), byte1=Y0, byte2=Cb(U), byte3=Y1
  *
- * UYVY 4-byte layout per 2 pixels:
- *   [U  Y0  V  Y1]
+ * Established 2026-08-21 by pointing the sensor at full-screen
+ * pure red and pure blue:
+ *   red  -> byte0 mean 230 (high Cr), byte2 mean 101 (low Cb)
+ *   blue -> byte0 mean 127,           byte2 mean 219 (high Cb)
+ * A face confirms: byte2 114 < 128 < byte0 144 (skin: Cb < Cr).
+ *
+ * The earlier "UYVY verified by memory dump" claim was invalid:
+ * that dump was on a grey scene where Cb~Cr~128, indistinguishable.
+ *
+ * VYUY 4-byte layout per 2 pixels:
+ *   [V   Y0  U   Y1]   i.e.   [Cr  Y0  Cb  Y1]
  *    b0  b1  b2  b3
  *
- * Source byte offset for pixel sx = sx * 2.
- *   even sx: Y=b0, U=b1, V=b3  (from p = row + sx*2)
- *   odd  sx: Y=b2, U=b1, V=b3  (from p = row + sx*2, same pair)
- * Simplified: always p = row + (sx & ~1)*2, then:
- *   Y = p[1 + (sx&1)*2],  U = p[0],  V = p[2]
+ * Pixel sx, pair pointer p = row + (sx & ~1) * 2:
+ *   Y = p[1 + (sx&1)*2],  Cr = p[0],  Cb = p[2]
  ****************************************************************************/
 
 static void uyvy_to_rgb565_scaled(const uint8_t *src,
@@ -3334,13 +3408,13 @@ static void uyvy_to_rgb565_scaled(const uint8_t *src,
 
           sx = dx * scale_x;
 
-          /* UYVY: pair pointer = start of 4-byte group */
+          /* VYUY: pair pointer = start of 4-byte group */
 
           const uint8_t *p = row + (sx & ~1) * 2;
 
           y0   = p[1 + (sx & 1) * 2];     /* Y0=p[1], Y1=p[3] */
-          cb_i = (int)p[0] - 128;          /* U  = byte0 */
-          cr_i = (int)p[2] - 128;          /* V  = byte2 */
+          cr_i = (int)p[0] - 128;          /* Cr (V) = byte0 */
+          cb_i = (int)p[2] - 128;          /* Cb (U) = byte2 */
 
           r = (int)y0 + cr_i + (cr_i * 51 / 128);
           g = (int)y0 - (cb_i * 28 / 81) - (cr_i * 365 / 512);
@@ -3373,7 +3447,7 @@ static void uyvy_to_rgb565_scaled(const uint8_t *src,
  *   instruction-fetch bottleneck in uyvy_to_rgb565_scaled().
  *
  *   Path A - "psram": convert directly from PSRAM source (scattered reads).
- *   Path B - "sram" : memcpy a 160x160 UYVY crop to SRAM first, then
+ *   Path B - "sram" : memcpy a 160x160 VYUY crop to SRAM first, then
  *            convert from there (sequential source reads).
  *
  *   Both paths output to the same destination buffer.  memcpy is timed
@@ -3411,7 +3485,7 @@ static void camera_bench_conversion(void)
   uint64_t ns_per_px;
   int i;
 
-  /* SRAM staging buffer - 51200 bytes, holds one 160x160 UYVY crop */
+  /* SRAM staging buffer - 51200 bytes, holds one 160x160 VYUY crop */
 
   static uint8_t sram_stage[BENCH_CROP_SIZE];
 
@@ -3433,12 +3507,12 @@ static void camera_bench_conversion(void)
 
   psram = g_camera_buf[0];
 
-  /* Fill with a deterministic UYVY test pattern so the benchmark is
+  /* Fill with a deterministic VYUY test pattern so the benchmark is
    * reproducible regardless of whether a real frame was captured.
-   * Luminance ramps horizontally, chroma is neutral (U=V=0x80).
+   * Luminance ramps horizontally, chroma is neutral (Cb=Cr=0x80).
    */
 
-  printf("[bench] filling PSRAM with UYVY test pattern ...\n");
+  printf("[bench] filling PSRAM with VYUY test pattern ...\n");
 
   for (i = 0; i < CAMERA_FRAME_SIZE; i += 4)
     {
@@ -3911,7 +3985,7 @@ cleanup_ctrl:
  * Name: yuv_to_rgb
  *
  * Description:
- *   Shared YUV→RGB helper for dump diagnostics.
+ *   Shared YUV->RGB helper for dump diagnostics.
  *   Input: Y, U, V as raw bytes (0-255).
  *   Output: r, g, b clamped to 0-255.
  *
@@ -4029,7 +4103,7 @@ int bk7258_camera_dump(void)
 
   /* Format definitions:
    *   YUYV: [Y0  U  Y1  V ] [Y2  U  Y3  V ] ...
-   *   UYVY: [U  Y0  V  Y1] [U  Y2  V  Y3] ...
+   *   VYUY: [V  Y0  U  Y1] [V  Y2  U  Y3] ...
    *   YYUV: [Y0 Y1  U   V ] [Y2 Y3  U   V ] ...
    *   UVYY: [U   V  Y0 Y1] [U   V  Y2 Y3] ...
    */
@@ -4066,15 +4140,15 @@ int bk7258_camera_dump(void)
                       y, u, v, r, g, b);
       }
 
-      /* UYVY: U=byte0 of pair, Y=byte1 or byte3, V=byte2 of pair */
+      /* VYUY: V=byte0, Y=byte1 or byte3, U=byte2 of pair (actual format) */
 
       {
-        uint8_t u = pb0;
+        uint8_t v = pb0;
         uint8_t y = (i & 1) ? pb3 : pb1;
-        uint8_t v = pb2;
+        uint8_t u = pb2;
         yuv_to_rgb(y, u, v, &r, &g, &b);
         n += snprintf(line + n, sizeof(line) - n,
-                      " UYVY(Y=%02X U=%02X V=%02X>R%3dG%3dB%3d)",
+                      " VYUY(Y=%02X U=%02X V=%02X>R%3dG%3dB%3d)",
                       y, u, v, r, g, b);
       }
 
@@ -4117,7 +4191,7 @@ int bk7258_camera_dump(void)
  * Description:
  *   Bypass camera - generate known RGB565 color bars and blit to LCD.
  *   If bars display correctly, blit + byte order are fine and the
- *   problem is in YUYV conversion.  If bars also look wrong, the
+ *   problem is in VYUY->RGB conversion.  If bars also look wrong, the
  *   problem is in the LCD path.
  *
  ****************************************************************************/
@@ -4220,6 +4294,1499 @@ int bk7258_camera_testpat(void)
 }
 
 /****************************************************************************
+ * Name: bk7258_camera_uvhist
+ *
+ * Description:
+ *   Diagnostic command: sample VYUY chrominance (U=Cb, V=Cr) and
+ *   luminance (Y) from a live camera frame and print ASCII histograms.
+ *
+ *   Sampling grid: 640x480 VYUY, every 4th group horizontally (80 cols),
+ *   every 8th row vertically (60 rows) = 4800 samples per frame.
+ *   Each sample reads one 32-bit word [V Y0 U Y1] from the aligned
+ *   PSRAM address - no byte-at-a-time reads.
+ *   byte0 = Cr (V), byte2 = Cb (U).  See uyvy_to_rgb565_scaled().
+ *
+ *   Two modes:
+ *     Full-range (lo<0 or lo>=hi): 16 buckets, high-nibble indexing.
+ *       Backward compatible with original usage.
+ *     Zoom (0<=lo<hi<=255): 32 buckets within [lo,hi].
+ *       Samples outside the range are counted separately.
+ *       Prints 32x32 UV grid (tight, no inter-char spaces),
+ *       1D U and V histograms (32 buckets each),
+ *       and peak with actual byte values (not bucket centers).
+ *
+ * Usage: camera uvhist [n] [lo] [hi]
+ *   n   = frame count (default 1, accumulated)
+ *   lo  = zoom range low  (default: full-range 16-bucket mode)
+ *   hi  = zoom range high (default: full-range 16-bucket mode)
+ *
+ ****************************************************************************/
+
+/* Histogram dimensions and sampling grid constants.
+ * FULL_BUCKETS = 16 for legacy full-range mode.
+ * ZOOM_BUCKETS = 32 for zoom mode.
+ */
+
+#define UVHIST_FULL_BUCKETS  16
+#define UVHIST_ZOOM_BUCKETS  32
+#define UVHIST_SAMPLES_X     80   /* every 4th VYUY group across 320 */
+#define UVHIST_SAMPLES_Y     60   /* every 8th row across 480 */
+#define UVHIST_TOTAL         (UVHIST_SAMPLES_X * UVHIST_SAMPLES_Y)
+
+/* Row stride in bytes: 640 pixels * 2 bytes/pixel = 1280 */
+
+#define UYVY_ROW_STRIDE      (CAMERA_HRES * CAMERA_BPP)
+
+int bk7258_camera_uvhist(int n_frames, int zoom_lo, int zoom_hi)
+{
+  /* Largest histogram buffer needed: ZOOM_BUCKETS^2 = 1024 entries.
+   * Full-range mode only uses the first FULL_BUCKETS^2 = 256 entries.
+   */
+
+  static uint32_t uv_hist[UVHIST_ZOOM_BUCKETS][UVHIST_ZOOM_BUCKETS];
+  static uint32_t u_hist[UVHIST_ZOOM_BUCKETS];
+  static uint32_t v_hist[UVHIST_ZOOM_BUCKETS];
+  static uint32_t y_hist[UVHIST_ZOOM_BUCKETS];
+
+  int ret;
+  int captured;
+  int timeout_ms;
+  int row;
+  int col;
+  uint32_t total_samples;
+  uint32_t in_range_samples;
+  uint32_t u_sum;
+  uint32_t v_sum;
+  uint32_t y_sum;
+  uint8_t u_min;
+  uint8_t u_max;
+  uint8_t v_min;
+  uint8_t v_max;
+  uint8_t y_min;
+  uint8_t y_max;
+  uint32_t peak_count;
+  uint8_t peak_u_val;
+  uint8_t peak_v_val;
+  uint32_t max_hist;
+  int i;
+  int j;
+  int nb;          /* number of buckets (16 or 32) */
+  int zoom;        /* 1 if zoom mode, 0 if full-range */
+  int range;       /* hi - lo in zoom mode */
+
+  /* Density characters for ASCII histogram: 10 levels from empty to full */
+
+  static const char density[] = " .:-=+*#%@";
+
+  if (n_frames <= 0) n_frames = 1;
+
+  /* Decide mode: zoom if both lo and hi are in [0,255] and lo < hi */
+
+  zoom = (zoom_lo >= 0 && zoom_hi > zoom_lo && zoom_hi <= 255);
+  nb = zoom ? UVHIST_ZOOM_BUCKETS : UVHIST_FULL_BUCKETS;
+  range = zoom ? (zoom_hi - zoom_lo) : 0;
+
+  if (!g_dvp_pins_configed)
+    {
+      syslog(LOG_ERR, "[uvhist] DVP pins not configured\n");
+      return -ENODEV;
+    }
+
+  if (!g_framebuf_allocated)
+    {
+      syslog(LOG_ERR, "[uvhist] frame buffers not allocated\n");
+      return -ENOMEM;
+    }
+
+  /* Zero accumulators */
+
+  memset(uv_hist, 0, sizeof(uint32_t) * nb * nb);
+  memset(u_hist, 0, sizeof(uint32_t) * nb);
+  memset(v_hist, 0, sizeof(uint32_t) * nb);
+  memset(y_hist, 0, sizeof(uint32_t) * nb);
+  total_samples = 0;
+  in_range_samples = 0;
+  u_sum = 0;
+  v_sum = 0;
+  y_sum = 0;
+  u_min = 255;
+  u_max = 0;
+  v_min = 255;
+  v_max = 0;
+  y_min = 255;
+  y_max = 0;
+  peak_count = 0;
+  peak_u_val = 0;
+  peak_v_val = 0;
+
+  /* Start DVP streaming */
+
+  ret = dvp_ctrl_config((uint32_t)(uintptr_t)g_camera_buf[0]);
+  if (ret < 0) goto cleanup_ctrl;
+
+  ret = dvp_irq_attach();
+  if (ret < 0) goto cleanup_irq;
+
+  g_dvp_vsync_count = 0;
+  g_dvp_frame_count = 0;
+  g_pingpong_count  = 0;
+  g_drop_count      = 0;
+  g_cur_buf         = 0;
+  g_ready_buf       = -1;
+  g_busy_buf        = -1;
+  g_stream_active   = true;
+
+  if (zoom)
+    {
+      syslog(LOG_INFO,
+             "[uvhist] start: %d frame(s), %d samples/frame, "
+             "zoom [%d..%d] %d buckets\n",
+             n_frames, UVHIST_TOTAL, zoom_lo, zoom_hi, nb);
+    }
+  else
+    {
+      syslog(LOG_INFO,
+             "[uvhist] start: %d frame(s), %d samples/frame, "
+             "full-range %d buckets\n",
+             n_frames, UVHIST_TOTAL, nb);
+    }
+
+  captured = 0;
+
+  while (captured < n_frames)
+    {
+      uint32_t frame_addr;
+      const uint8_t *buf;
+
+      timeout_ms = 5000;
+      while (timeout_ms > 0)
+        {
+          frame_addr = dvp_frame_get();
+          if (frame_addr != 0) break;
+          up_udelay(1000);
+          timeout_ms--;
+        }
+
+      if (frame_addr == 0)
+        {
+          syslog(LOG_ERR, "[uvhist] TIMEOUT waiting for frame %d/%d\n",
+                 captured + 1, n_frames);
+          ret = -ETIMEDOUT;
+          break;
+        }
+
+      buf = (const uint8_t *)(uintptr_t)frame_addr;
+      captured++;
+
+      /* Sample the grid: 60 rows x 80 columns.
+       * Byte order is V Y0 U Y1 (see uyvy_to_rgb565_scaled).
+       * byte0 = Cr (V), byte2 = Cb (U).
+       * The local names u/v below keep their chroma meaning:
+       * u = Cb, v = Cr.
+       * Row stride = 1280 bytes, sample stride = 16 bytes (4 groups).
+       */
+
+      for (row = 0; row < CAMERA_VRES; row += 8)
+        {
+          const uint8_t *row_base = buf + row * UYVY_ROW_STRIDE;
+
+          for (col = 0; col < UVHIST_SAMPLES_X; col++)
+            {
+              uint32_t pixel = *(const uint32_t *)(row_base + col * 16);
+              uint8_t v = (uint8_t)(pixel & 0xff);         /* Cr = byte0 */
+              uint8_t y = (uint8_t)((pixel >> 8) & 0xff);
+              uint8_t u = (uint8_t)((pixel >> 16) & 0xff); /* Cb = byte2 */
+
+              total_samples++;
+
+              /* Running stats (always full range) */
+
+              u_sum += u;
+              v_sum += v;
+              y_sum += y;
+
+              if (u < u_min) u_min = u;
+              if (u > u_max) u_max = u;
+              if (v < v_min) v_min = v;
+              if (v > v_max) v_max = v;
+              if (y < y_min) y_min = y;
+              if (y > y_max) y_max = y;
+
+              /* Y histogram: always 16-bucket full-range */
+
+              y_hist[y >> 4]++;
+
+              if (zoom)
+                {
+                  /* Zoom mode: bucket into [lo,hi] range */
+
+                  if (u >= zoom_lo && u < zoom_hi &&
+                      v >= zoom_lo && v < zoom_hi)
+                    {
+                      int u_idx = (int)(u - zoom_lo) * nb / range;
+                      int v_idx = (int)(v - zoom_lo) * nb / range;
+
+                      if (u_idx >= nb) u_idx = nb - 1;
+                      if (v_idx >= nb) v_idx = nb - 1;
+
+                      uv_hist[v_idx][u_idx]++;
+                      u_hist[u_idx]++;
+                      v_hist[v_idx]++;
+                      in_range_samples++;
+
+                      /* Peak tracking with actual values */
+
+                      if (uv_hist[v_idx][u_idx] > peak_count)
+                        {
+                          peak_count = uv_hist[v_idx][u_idx];
+                          peak_u_val = u;
+                          peak_v_val = v;
+                        }
+                    }
+                }
+              else
+                {
+                  /* Full-range mode: high-nibble indexing */
+
+                  int u_idx = u >> 4;
+                  int v_idx = v >> 4;
+
+                  uv_hist[v_idx][u_idx]++;
+                  u_hist[u_idx]++;
+                  v_hist[v_idx]++;
+
+                  if (uv_hist[v_idx][u_idx] > peak_count)
+                    {
+                      peak_count = uv_hist[v_idx][u_idx];
+                      peak_u_val = u;
+                      peak_v_val = v;
+                    }
+                }
+            }
+        }
+
+      dvp_frame_put();
+
+      if (n_frames > 1)
+        {
+          syslog(LOG_INFO, "[uvhist] frame %d/%d sampled\n",
+                 captured, n_frames);
+        }
+    }
+
+  /* Stop streaming */
+
+  g_stream_active = false;
+  dvp_irq_detach();
+  dvp_ctrl_deconfig();
+
+  if (total_samples == 0)
+    {
+      printf("[uvhist] no samples collected\n");
+      return ret < 0 ? ret : -EIO;
+    }
+
+  /* ========== Print results ========== */
+
+  printf("\n");
+
+  if (zoom)
+    {
+      printf("[uvhist] === UV/Y histogram (%d frame(s), %lu samples, "
+             "zoom [%d..%d], %d buckets) ===\n",
+             n_frames, (unsigned long)total_samples,
+             zoom_lo, zoom_hi, nb);
+      printf("[uvhist] in-range: %lu  out-of-range: %lu\n",
+             (unsigned long)in_range_samples,
+             (unsigned long)(total_samples - in_range_samples));
+    }
+  else
+    {
+      printf("[uvhist] === UV/Y histogram (%d frame(s), %lu samples, "
+             "full-range, %d buckets) ===\n",
+             n_frames, (unsigned long)total_samples, nb);
+    }
+
+  printf("\n");
+
+  /* Summary stats */
+
+  printf("[uvhist] U(Cb): min=%3u  max=%3u  mean=%lu\n",
+         u_min, u_max,
+         (unsigned long)(u_sum / total_samples));
+  printf("[uvhist] V(Cr): min=%3u  max=%3u  mean=%lu\n",
+         v_min, v_max,
+         (unsigned long)(v_sum / total_samples));
+  printf("[uvhist] Y:     min=%3u  max=%3u  mean=%lu\n",
+         y_min, y_max,
+         (unsigned long)(y_sum / total_samples));
+
+  if (peak_count > 0)
+    {
+      printf("[uvhist] peak UV: (U=0x%02X, V=0x%02X) count=%lu\n",
+             peak_u_val, peak_v_val,
+             (unsigned long)peak_count);
+    }
+
+  printf("\n");
+
+  /* ========== 1D U histogram ========== */
+
+  printf("[uvhist] U(Cb) histogram (%d buckets", nb);
+
+  if (zoom)
+    {
+      printf(", range [%d..%d]", zoom_lo, zoom_hi);
+    }
+
+  printf(")\n");
+
+  max_hist = 0;
+  for (i = 0; i < nb; i++)
+    {
+      if (u_hist[i] > max_hist) max_hist = u_hist[i];
+    }
+
+  for (i = 0; i < nb; i++)
+    {
+      int bar_len;
+      int val;
+
+      if (zoom)
+        {
+          val = zoom_lo + (range * i + range / 2) / nb;
+        }
+      else
+        {
+          val = (i << 4) | 0x08;
+        }
+
+      printf("[uvhist] %3d [%5lu] ", val, (unsigned long)u_hist[i]);
+
+      if (max_hist > 0)
+        {
+          bar_len = (int)((uint64_t)u_hist[i] * 40 / max_hist);
+        }
+      else
+        {
+          bar_len = 0;
+        }
+
+      for (j = 0; j < bar_len; j++)
+        {
+          printf("#");
+        }
+
+      printf("\n");
+    }
+
+  printf("\n");
+
+  /* ========== 1D V histogram ========== */
+
+  printf("[uvhist] V(Cr) histogram (%d buckets", nb);
+
+  if (zoom)
+    {
+      printf(", range [%d..%d]", zoom_lo, zoom_hi);
+    }
+
+  printf(")\n");
+
+  max_hist = 0;
+  for (i = 0; i < nb; i++)
+    {
+      if (v_hist[i] > max_hist) max_hist = v_hist[i];
+    }
+
+  for (i = 0; i < nb; i++)
+    {
+      int bar_len;
+      int val;
+
+      if (zoom)
+        {
+          val = zoom_lo + (range * i + range / 2) / nb;
+        }
+      else
+        {
+          val = (i << 4) | 0x08;
+        }
+
+      printf("[uvhist] %3d [%5lu] ", val, (unsigned long)v_hist[i]);
+
+      if (max_hist > 0)
+        {
+          bar_len = (int)((uint64_t)v_hist[i] * 40 / max_hist);
+        }
+      else
+        {
+          bar_len = 0;
+        }
+
+      for (j = 0; j < bar_len; j++)
+        {
+          printf("#");
+        }
+
+      printf("\n");
+    }
+
+  printf("\n");
+
+  /* ========== 2D UV histogram (ASCII art) ========== */
+
+  if (zoom)
+    {
+      /* Zoom mode: 32x32 tight grid, tick marks every 8 columns */
+
+      printf("[uvhist] UV 32x32 grid (U=Cb horiz, V=Cr vert, "
+             "range [%d..%d])\n", zoom_lo, zoom_hi);
+
+      /* Column header with tick marks every 8 columns */
+
+      printf("[uvhist] V\\U  ");
+      for (j = 0; j < nb; j++)
+        {
+          if ((j & 7) == 0)
+            {
+              int uval = zoom_lo + (range * j + range / 2) / nb;
+              printf("%-8d", uval);
+            }
+        }
+
+      printf("\n");
+
+      /* Find max for density scaling (within zoom grid) */
+
+      max_hist = 0;
+      for (i = 0; i < nb; i++)
+        {
+          for (j = 0; j < nb; j++)
+            {
+              if (uv_hist[i][j] > max_hist)
+                {
+                  max_hist = uv_hist[i][j];
+                }
+            }
+        }
+
+      /* Print rows: tight format, no spaces between chars */
+
+      for (i = 0; i < nb; i++)
+        {
+          int vval = zoom_lo + (range * i + range / 2) / nb;
+
+          printf("[uvhist] %3d ", vval);
+
+          for (j = 0; j < nb; j++)
+            {
+              uint32_t count = uv_hist[i][j];
+
+              if (count == 0)
+                {
+                  printf(".");
+                }
+              else
+                {
+                  int level;
+                  if (max_hist == 0)
+                    {
+                      level = 1;
+                    }
+                  else
+                    {
+                      level = (int)((uint64_t)count * 9 / max_hist);
+                      if (level < 1) level = 1;
+                      if (level > 9) level = 9;
+                    }
+
+                  printf("%c", density[level]);
+                }
+            }
+
+          printf("\n");
+        }
+    }
+  else
+    {
+      /* Full-range mode: 16x16 spaced grid (original style) */
+
+      printf("[uvhist] UV 16x16 grid (U=Cb horiz, V=Cr vert)\n");
+
+      /* Column header */
+
+      printf("[uvhist] V\\U ");
+      for (j = 0; j < UVHIST_FULL_BUCKETS; j++)
+        {
+          printf(" %02x ", (j << 4) | 0x08);
+        }
+
+      printf("\n");
+
+      /* Find max for density scaling */
+
+      max_hist = 0;
+      for (i = 0; i < UVHIST_FULL_BUCKETS; i++)
+        {
+          for (j = 0; j < UVHIST_FULL_BUCKETS; j++)
+            {
+              if (uv_hist[i][j] > max_hist)
+                {
+                  max_hist = uv_hist[i][j];
+                }
+            }
+        }
+
+      for (i = 0; i < UVHIST_FULL_BUCKETS; i++)
+        {
+          printf("[uvhist] %02X  ", (i << 4) | 0x08);
+
+          for (j = 0; j < UVHIST_FULL_BUCKETS; j++)
+            {
+              uint32_t count = uv_hist[i][j];
+
+              if (count == 0)
+                {
+                  printf("  . ");
+                }
+              else
+                {
+                  int level;
+                  if (max_hist == 0)
+                    {
+                      level = 1;
+                    }
+                  else
+                    {
+                      level = (int)((uint64_t)count * 9 / max_hist);
+                      if (level < 1) level = 1;
+                      if (level > 9) level = 9;
+                    }
+
+                  printf("  %c ", density[level]);
+                }
+            }
+
+          printf("\n");
+        }
+    }
+
+  printf("\n");
+
+  /* ========== Y histogram (ASCII bar chart, always 16 buckets) ========== */
+
+  printf("[uvhist] Y histogram (luminance, 16 buckets)\n");
+  printf("\n");
+
+  max_hist = 0;
+  for (i = 0; i < UVHIST_FULL_BUCKETS; i++)
+    {
+      if (y_hist[i] > max_hist)
+        {
+          max_hist = y_hist[i];
+        }
+    }
+
+  for (i = 0; i < UVHIST_FULL_BUCKETS; i++)
+    {
+      int bar_len;
+
+      printf("[uvhist] 0x%02X [%5lu] ",
+             (i << 4) | 0x08,
+             (unsigned long)y_hist[i]);
+
+      if (max_hist > 0)
+        {
+          bar_len = (int)((uint64_t)y_hist[i] * 40 / max_hist);
+        }
+      else
+        {
+          bar_len = 0;
+        }
+
+      for (j = 0; j < bar_len; j++)
+        {
+          printf("#");
+        }
+
+      printf("\n");
+    }
+
+  printf("\n");
+
+  return ret < 0 ? ret : 0;
+
+cleanup_irq:
+  dvp_irq_detach();
+cleanup_ctrl:
+  dvp_ctrl_deconfig();
+  return ret;
+}
+
+/****************************************************************************
+ * camera detect: UV chrominance direction detection
+ ****************************************************************************/
+
+/* Direction result from a single-frame skin-tone scan.
+ * cx is fixed-point x10 (e.g. cx=395 means column 39.5).
+ */
+
+struct cam_dir_s
+{
+  int      dx;         /* -127..+127, negative = left side */
+  int      cx;         /* blob centroid, column x10 */
+  int      blob_l;     /* left edge of blob */
+  int      blob_r;     /* right edge of blob */
+  uint32_t blob_hits;  /* skin hits inside blob */
+  uint32_t total_hits; /* total skin hits in frame */
+  int      cr_lo;      /* adaptive Cr threshold used this frame */
+  bool     valid;      /* true if blob_hits >= threshold */
+};
+
+/****************************************************************************
+ * Name: camera_detect_frame
+ *
+ * Description:
+ *   Scan one VYUY frame for skin-tone pixels, extract blob direction.
+ *   Sampling grid: 80 columns x 60 rows (identical to uvhist).
+ *   Triple gate: Y in [SKIN_Y_LO..SKIN_Y_HI],
+ *                Cb in [SKIN_CB_LO..SKIN_CB_HI],
+ *                Cr in [SKIN_CR_LO..SKIN_CR_HI].
+ *   Blob extraction: peak column, half-maximum expand, weighted centroid.
+ *
+ *   Output written to *out.  Returns 0 always.
+ *
+ ****************************************************************************/
+
+static int camera_detect_frame(const uint8_t *buf,
+                               struct cam_dir_s *out)
+{
+  static uint16_t col_hist[DETECT_SAMPLES_X];
+  static uint16_t cr_hist[256];
+
+  int row;
+  int col;
+  int i;
+  int bg_cr;
+  int max_cr;
+  int span;
+  int cr_lo;
+  uint16_t bg_count;
+  uint32_t total_hits;
+  uint32_t frame_samples;
+  int peak_col;
+  uint16_t peak_val;
+  int blob_l;
+  int blob_r;
+  uint32_t blob_weighted_sum;
+  uint32_t blob_hits;
+  int cx;
+  int dx;
+
+  memset(col_hist, 0, sizeof(col_hist));
+  memset(cr_hist, 0, sizeof(cr_hist));
+  total_hits = 0;
+  frame_samples = 0;
+
+  /* Pass 1: histogram Cr over luminance-valid samples to locate the
+   * background (neutral) Cr peak.  Byte order VYUY: byte0=Cr, byte1=Y0,
+   * byte2=Cb.  The demo scene has no wood, so the only reddish
+   * population above the neutral peak is skin.
+   */
+
+  for (row = 0; row < CAMERA_VRES; row += 8)
+    {
+      const uint8_t *row_base = buf + row * UYVY_ROW_STRIDE;
+
+      for (col = 0; col < DETECT_SAMPLES_X; col++)
+        {
+          uint32_t pixel =
+            *(const uint32_t *)(row_base + col * 16);
+          uint8_t cr = (uint8_t)(pixel & 0xff);
+          uint8_t y  = (uint8_t)((pixel >> 8) & 0xff);
+
+          if (y >= SKIN_Y_LO && y <= SKIN_Y_HI)
+            {
+              cr_hist[cr]++;
+            }
+        }
+    }
+
+  /* Background Cr mode */
+
+  bg_cr = 128;
+  bg_count = 0;
+  for (i = 0; i < 256; i++)
+    {
+      if (cr_hist[i] > bg_count)
+        {
+          bg_count = cr_hist[i];
+          bg_cr = i;
+        }
+    }
+
+  /* Robust max Cr: highest bin with real support (ignore single-pixel
+   * outliers so one hot pixel cannot skew the threshold).
+   */
+
+  max_cr = bg_cr;
+  for (i = 255; i > bg_cr; i--)
+    {
+      if (cr_hist[i] >= 3)
+        {
+          max_cr = i;
+          break;
+        }
+    }
+
+  /* Adaptive skin threshold: sit ~60% of the way from the neutral peak
+   * up to the reddest real Cr.  This keeps the gate in the UPPER part of
+   * the skin cluster so only the face core passes (tight blob, stable
+   * centroid) instead of the whole reddish body/background.  A floor
+   * margin keeps it clear of the neutral peak; clamp bounds it.  Adapts
+   * to skin strength and lighting automatically.
+   */
+
+  /* Clamp max_cr: orange wires/copper reach 175+ which would push
+   * cr_lo to the 156 ceiling and reject real skin (~164).  Capping
+   * at SKIN_CR_CEIL keeps the adaptive threshold in skin range.
+   */
+
+  if (max_cr > SKIN_CR_CEIL) max_cr = SKIN_CR_CEIL;
+
+  span = max_cr - bg_cr;
+  cr_lo = bg_cr + (span * 6) / 10;
+  if (cr_lo < bg_cr + SKIN_CR_MARGIN) cr_lo = bg_cr + SKIN_CR_MARGIN;
+  if (cr_lo < SKIN_CR_LO_MIN) cr_lo = SKIN_CR_LO_MIN;
+  if (cr_lo > SKIN_CR_LO_MAX) cr_lo = SKIN_CR_LO_MAX;
+  out->cr_lo = cr_lo;
+
+  /* Pass 2: per-column skin count using the adaptive threshold */
+
+  for (row = 0; row < CAMERA_VRES; row += 8)
+    {
+      const uint8_t *row_base = buf + row * UYVY_ROW_STRIDE;
+
+      for (col = 0; col < DETECT_SAMPLES_X; col++)
+        {
+          uint32_t pixel =
+            *(const uint32_t *)(row_base + col * 16);
+          uint8_t cr = (uint8_t)(pixel & 0xff);
+          uint8_t y  = (uint8_t)((pixel >> 8) & 0xff);
+          uint8_t cb = (uint8_t)((pixel >> 16) & 0xff);
+
+          frame_samples++;
+
+          if (y >= SKIN_Y_LO && y <= SKIN_Y_HI &&
+              cb >= SKIN_CB_LO && cb <= SKIN_CB_HI &&
+              cr >= cr_lo && cr <= SKIN_CR_HI)
+            {
+              col_hist[col]++;
+              total_hits++;
+            }
+        }
+    }
+
+  /* Minimum hit check */
+
+  if (total_hits < DETECT_MIN_HITS_PER_FRAME)
+    {
+      out->dx = 0;
+      out->cx = (DETECT_SAMPLES_X - 1) * 5; /* center x10 */
+      out->blob_l = 0;
+      out->blob_r = 0;
+      out->blob_hits = 0;
+      out->total_hits = total_hits;
+      out->valid = false;
+      return 0;
+    }
+
+  /* Find peak column */
+
+  peak_col = 0;
+  peak_val = 0;
+  for (i = 0; i < DETECT_SAMPLES_X; i++)
+    {
+      if (col_hist[i] > peak_val)
+        {
+          peak_val = col_hist[i];
+          peak_col = i;
+        }
+    }
+
+  /* Half-maximum region growing */
+
+  blob_l = peak_col;
+  blob_r = peak_col;
+
+  while (blob_l > 0 &&
+         col_hist[blob_l - 1] >= peak_val / 2)
+    {
+      blob_l--;
+    }
+
+  while (blob_r < DETECT_SAMPLES_X - 1 &&
+         col_hist[blob_r + 1] >= peak_val / 2)
+    {
+      blob_r++;
+    }
+
+  /* Weighted centroid within blob */
+
+  blob_weighted_sum = 0;
+  blob_hits = 0;
+  for (i = blob_l; i <= blob_r; i++)
+    {
+      blob_weighted_sum += (uint32_t)col_hist[i] * i;
+      blob_hits += col_hist[i];
+    }
+
+  cx = blob_hits > 0
+    ? (int)(blob_weighted_sum * 10 / blob_hits)
+    : peak_col * 10;
+
+  /* Normalized direction: symmetric mapping.
+   * Index range 0..79, center = 39.5 = (N-1)/2.
+   * dx = (cx_x10 - 395) * 127 / 395, clamped.
+   */
+
+  dx = (cx - (DETECT_SAMPLES_X - 1) * 5) * 127
+       / ((DETECT_SAMPLES_X - 1) * 5);
+  if (dx < -127) dx = -127;
+  if (dx > 127)  dx = 127;
+
+  out->dx = dx;
+  out->cx = cx;
+  out->blob_l = blob_l;
+  out->blob_r = blob_r;
+  out->blob_hits = blob_hits;
+  out->total_hits = total_hits;
+  out->valid = true;
+  return 0;
+}
+
+/****************************************************************************
+ * Name: bk7258_camera_detect
+ *
+ * Description:
+ *   Multi-frame skin-tone direction detection with ASCII histogram output.
+ *   Calls camera_detect_frame() per frame, accumulates col_hist for
+ *   the final chart.
+ *
+ ****************************************************************************/
+
+int bk7258_camera_detect(int n_frames)
+{
+  static uint16_t col_hist[DETECT_SAMPLES_X];
+
+  struct cam_dir_s dir;
+  int ret;
+  int captured;
+  int timeout_ms;
+  uint32_t total_samples;
+  uint32_t total_hits;
+  uint32_t acc_blob_hits;
+  float confidence;
+  int i;
+
+  static const char density[] = " .:-=+*#%@";
+
+  /* Cap to prevent uint16_t col_hist overflow (60 hits/col/frame max).
+   * 1092 frames * 60 = 65520 < 65535.  Use 1000 for round limit.
+   */
+
+  if (n_frames <= 0) n_frames = 1;
+  if (n_frames > 1000) n_frames = 1000;
+
+  if (!g_dvp_pins_configed)
+    {
+      syslog(LOG_ERR, "[detect] DVP pins not configured\n");
+      return -ENODEV;
+    }
+
+  if (!g_framebuf_allocated)
+    {
+      syslog(LOG_ERR, "[detect] frame buffers not allocated\n");
+      return -ENOMEM;
+    }
+
+  memset(col_hist, 0, sizeof(col_hist));
+  total_samples = 0;
+  total_hits = 0;
+  acc_blob_hits = 0;
+
+  /* Start DVP streaming */
+
+  ret = dvp_ctrl_config((uint32_t)(uintptr_t)g_camera_buf[0]);
+  if (ret < 0) goto cleanup_ctrl;
+
+  ret = dvp_irq_attach();
+  if (ret < 0) goto cleanup_irq;
+
+  g_dvp_vsync_count = 0;
+  g_dvp_frame_count = 0;
+  g_pingpong_count  = 0;
+  g_drop_count      = 0;
+  g_cur_buf         = 0;
+  g_ready_buf       = -1;
+  g_busy_buf        = -1;
+  g_stream_active   = true;
+
+  syslog(LOG_INFO,
+         "[detect] start: %d frame(s), %d samples/frame, "
+         "adaptive Cr (bg+%d, clamp %d..%d) Y=[%d..%d] Cb=[%d..%d]\n",
+         n_frames, DETECT_TOTAL,
+         SKIN_CR_MARGIN, SKIN_CR_LO_MIN, SKIN_CR_LO_MAX,
+         SKIN_Y_LO, SKIN_Y_HI, SKIN_CB_LO, SKIN_CB_HI);
+
+  /* Warm-up: discard first 20 frames so AE/AWB settles before sampling.
+   * A single-frame detect on a cold sensor otherwise catches a
+   * mid-convergence frame (over/under-exposed, wrong white balance).
+   */
+
+  for (i = 0; i < 20; i++)
+    {
+      uint32_t warm_addr;
+
+      timeout_ms = 1000;
+      while (timeout_ms > 0)
+        {
+          warm_addr = dvp_frame_get();
+          if (warm_addr != 0) break;
+          up_udelay(1000);
+          timeout_ms--;
+        }
+
+      if (warm_addr == 0)
+        {
+          syslog(LOG_ERR, "[detect] TIMEOUT warm-up frame %d\n", i);
+          ret = -ETIMEDOUT;
+          g_stream_active = false;
+          goto cleanup_irq;
+        }
+
+      dvp_frame_put();
+    }
+
+  captured = 0;
+
+  while (captured < n_frames)
+    {
+      uint32_t frame_addr;
+      const uint8_t *buf;
+
+      timeout_ms = 5000;
+      while (timeout_ms > 0)
+        {
+          frame_addr = dvp_frame_get();
+          if (frame_addr != 0) break;
+          up_udelay(1000);
+          timeout_ms--;
+        }
+
+      if (frame_addr == 0)
+        {
+          syslog(LOG_ERR,
+                 "[detect] TIMEOUT frame %d/%d\n",
+                 captured + 1, n_frames);
+          ret = -ETIMEDOUT;
+          break;
+        }
+
+      buf = (const uint8_t *)(uintptr_t)frame_addr;
+      captured++;
+
+      camera_detect_frame(buf, &dir);
+
+      /* Accumulate col_hist from this frame's contribution.
+       * camera_detect_frame() uses its own internal col_hist
+       * which is zeroed each call, so we add its results
+       * to our accumulated col_hist via the blob info.
+       * For the ASCII chart we re-use the last frame's data.
+       */
+
+      total_samples += DETECT_TOTAL;
+      total_hits += dir.total_hits;
+      acc_blob_hits += dir.blob_hits;
+
+      /* Per-frame jitter output (n>1) */
+
+      if (n_frames > 1)
+        {
+          if (!dir.valid)
+            {
+              printf("[detect] frame %d: no target "
+                     "(%lu hits < %d min)\n",
+                     captured,
+                     (unsigned long)dir.total_hits,
+                     DETECT_MIN_HITS_PER_FRAME);
+            }
+          else
+            {
+              printf("[detect] frame %d: dx=%+d "
+                     "cx=%.1f blob[%d..%d] "
+                     "hits=%lu/%d\n",
+                     captured, dir.dx,
+                     (float)dir.cx / 10.0f,
+                     dir.blob_l, dir.blob_r,
+                     (unsigned long)dir.blob_hits,
+                     (int)DETECT_TOTAL);
+            }
+        }
+
+      dvp_frame_put();
+    }
+
+  /* Stop streaming */
+
+  g_stream_active = false;
+  dvp_irq_detach();
+  dvp_ctrl_deconfig();
+
+  /* Minimum hit check on accumulated blob hits */
+
+  if (acc_blob_hits <
+      (uint32_t)DETECT_MIN_HITS_PER_FRAME * n_frames)
+    {
+      printf("\n");
+      printf("[detect] no target (%lu blob hits < %d min)\n",
+             (unsigned long)acc_blob_hits,
+             (int)(DETECT_MIN_HITS_PER_FRAME * n_frames));
+
+      /* Separate the two failure modes.  total_hits == 0 means the
+       * skin-tone gate never fired at all (sensor, exposure or gate
+       * problem); a healthy total_hits with zero blob hits means the
+       * blob extraction stage is at fault.  Without this line the log
+       * looks identical in both cases.
+       */
+
+      printf("[detect] total_hits=%lu / %lu samples  "
+             "gate Y=[%d..%d] Cb=[%d..%d] Cr=[%d..%d]\n",
+             (unsigned long)total_hits,
+             (unsigned long)total_samples,
+             SKIN_Y_LO, SKIN_Y_HI,
+             SKIN_CB_LO, SKIN_CB_HI,
+             SKIN_CR_LO, SKIN_CR_HI);
+      return 0;
+    }
+
+  /* Re-run last frame for ASCII chart */
+
+  confidence = total_samples > 0
+    ? (float)acc_blob_hits * 100.0f / (float)total_samples
+    : 0.0f;
+
+  printf("\n");
+  printf("[detect] %d frame(s): %lu blob / %lu total / "
+         "%lu samples (%.1f%%)\n",
+         n_frames,
+         (unsigned long)acc_blob_hits,
+         (unsigned long)total_hits,
+         (unsigned long)total_samples,
+         confidence);
+
+  /* Print last frame's direction result */
+
+  printf("\n");
+  printf("[detect] peak=%d  blob=[%d..%d]  width=%d  "
+         "cx=%.1f  dx=%+d\n",
+         dir.blob_l + (dir.blob_r - dir.blob_l) / 2,
+         dir.blob_l, dir.blob_r,
+         dir.blob_r - dir.blob_l + 1,
+         (float)dir.cx / 10.0f,
+         dir.dx);
+  printf("[detect] blob_hits=%lu  total_hits=%lu\n",
+         (unsigned long)dir.blob_hits,
+         (unsigned long)dir.total_hits);
+  printf("[detect] dx=%+d  (%s)\n",
+         dir.dx,
+         dir.dx < -10 ? "LEFT" :
+         dir.dx > 10 ? "RIGHT" : "CENTER");
+
+  return 0;
+
+cleanup_irq:
+  dvp_irq_detach();
+cleanup_ctrl:
+  dvp_ctrl_deconfig();
+  return ret;
+}
+
+/****************************************************************************
+ * camera track: skin-tone gaze tracking with dual-panel eye control
+ ****************************************************************************/
+
+/* EMA smoothing factor: smooth = (smooth*3 + raw) / 4 */
+
+#define TRACK_EMA_SHIFT     2
+#define TRACK_EMA_WEIGHT    7
+
+/* Miss-to-center: after this many consecutive frames without a valid
+ * target, start drifting the gaze back to center (gaze=0).
+ */
+
+#define TRACK_MISS_TO_CENTER  8
+
+/* Maximum pupil travel in pixels.
+ * Iris r=58, pupil r=22, erase r=23.
+ * Beyond |28| the erase circle clips outside the iris.
+ */
+
+#define TRACK_GAZE_MAX     28
+
+/* Full-scale |dx| for gaze mapping.
+ * A face blob centroid never reaches the frame edge, so |dx| tops out
+ * around 60-65 in practice (empirically raw ~ -60 for a face at column
+ * 20/80).  Mapping against 127 wasted more than half the pupil travel
+ * (raw -60 -> gaze -13).  Mapping against 64 lets a realistic face
+ * offset drive the pupil across its full +/-TRACK_GAZE_MAX range.
+ */
+
+#define TRACK_DX_SPAN      45   /* legacy fixed span (unused now) */
+#define TRACK_SPAN_MIN     30   /* floor: prevents over-amplification */
+
+int bk7258_camera_track(int n_frames, int invert)
+{
+  struct cam_dir_s dir;
+  int ret;
+  int captured;
+  int timeout_ms;
+  int smooth;         /* EMA-smoothed dx, -127..+127 */
+  int last_gaze;      /* last drawn gaze (for dead zone) */
+  int miss_count;     /* consecutive frames without target */
+  int dx_baseline;    /* slowly-tracked neutral face position */
+  bool baseline_init; /* true once first valid frame sets baseline */
+  int dx_span_pos;    /* adaptive rightward (positive) span */
+  int dx_span_neg;    /* adaptive leftward (negative) span */
+  int i;
+  bool continuous;
+  int stdin_flags = 0;
+
+  continuous = (n_frames <= 0);          /* n<=0 => run until keypress */
+  if (!continuous && n_frames > 1000) n_frames = 1000;
+
+  if (!g_dvp_pins_configed)
+    {
+      syslog(LOG_ERR, "[track] DVP pins not configured\n");
+      return -ENODEV;
+    }
+
+  if (!g_framebuf_allocated)
+    {
+      syslog(LOG_ERR, "[track] frame buffers not allocated\n");
+      return -ENOMEM;
+    }
+
+  /* Start DVP streaming */
+
+  ret = dvp_ctrl_config((uint32_t)(uintptr_t)g_camera_buf[0]);
+  if (ret < 0) goto cleanup_ctrl;
+
+  ret = dvp_irq_attach();
+  if (ret < 0) goto cleanup_irq;
+
+  g_dvp_vsync_count = 0;
+  g_dvp_frame_count = 0;
+  g_pingpong_count  = 0;
+  g_drop_count      = 0;
+  g_cur_buf         = 0;
+  g_ready_buf       = -1;
+  g_busy_buf        = -1;
+  g_stream_active   = true;
+
+  /* Initialize LCD */
+
+  ret = bk7258_lcd_preview_init();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "[track] LCD init failed: %d\n", ret);
+      goto stop_stream;
+    }
+
+  /* Draw both eyes centered */
+
+  bk7258_lcd_eye_draw(0, 0);
+  bk7258_lcd_eye_draw(1, 0);
+
+  syslog(LOG_INFO,
+         "[track] start: %d frames, invert=%d, "
+         "Cr>=%d, gaze_max=%d\n",
+         n_frames, invert, SKIN_CR_LO, TRACK_GAZE_MAX);
+
+  /* Warm-up: discard first 20 frames (AE/AWB convergence) */
+
+  for (i = 0; i < 20; i++)
+    {
+      uint32_t frame_addr;
+
+      timeout_ms = 1000;
+      while (timeout_ms > 0)
+        {
+          frame_addr = dvp_frame_get();
+          if (frame_addr != 0) break;
+          up_udelay(1000);
+          timeout_ms--;
+        }
+
+      if (frame_addr == 0)
+        {
+          syslog(LOG_ERR,
+                 "[track] TIMEOUT warm-up frame %d\n", i);
+          ret = -ETIMEDOUT;
+          goto stop_lcd;
+        }
+
+      dvp_frame_put();
+    }
+
+  smooth = 0;
+  last_gaze = 0;
+  miss_count = 0;
+  dx_baseline = 0;
+  baseline_init = false;
+  dx_span_pos = TRACK_SPAN_MIN;
+  dx_span_neg = TRACK_SPAN_MIN;
+  captured = 0;
+
+  if (continuous)
+    {
+      /* Non-blocking stdin so any keypress stops the loop. */
+
+      stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags | O_NONBLOCK);
+      syslog(LOG_INFO,
+             "[track] continuous mode - press Enter to stop\n");
+    }
+
+  while (continuous || captured < n_frames)
+    {
+      uint32_t frame_addr;
+      int raw_dx;
+      int new_gaze;
+
+      if (continuous)
+        {
+          char ch;
+          if (read(STDIN_FILENO, &ch, 1) > 0)
+            {
+              break;
+            }
+        }
+
+      timeout_ms = 5000;
+      while (timeout_ms > 0)
+        {
+          frame_addr = dvp_frame_get();
+          if (frame_addr != 0) break;
+          up_udelay(1000);
+          timeout_ms--;
+        }
+
+      if (frame_addr == 0)
+        {
+          syslog(LOG_ERR,
+                 "[track] TIMEOUT frame %d/%d\n",
+                 captured + 1, n_frames);
+          ret = -ETIMEDOUT;
+          break;
+        }
+
+      camera_detect_frame(
+        (const uint8_t *)(uintptr_t)frame_addr, &dir);
+      dvp_frame_put();
+      captured++;
+
+      if (!dir.valid)
+        {
+          miss_count++;
+
+          if (miss_count >= TRACK_MISS_TO_CENTER)
+            {
+              /* Drift toward center */
+
+              raw_dx = 0;
+            }
+          else
+            {
+              /* Hold last direction */
+
+              raw_dx = smooth;
+            }
+        }
+      else
+        {
+          int d = invert ? -dir.dx : dir.dx;
+
+          miss_count = 0;
+
+          /* First valid frame initialises baseline so the
+           * very first gaze starts centred.
+           */
+
+          if (!baseline_init)
+            {
+              dx_baseline = d;
+              baseline_init = true;
+            }
+
+          /* Slowly track the neutral face position (~seconds
+           * time constant) to compensate for camera framing.
+           * Only updated on valid frames so the baseline does
+           * not drift when no face is present.
+           */
+
+          dx_baseline = (dx_baseline * 31 + d) / 32;
+
+          /* Offset from baseline is the gaze signal; this
+           * makes left/right symmetric around the user's
+           * natural resting position.
+           */
+
+          raw_dx = d - dx_baseline;
+        }
+
+      /* EMA smoothing: smooth = (smooth*3 + raw) / 4
+       *
+       * Division, not an arithmetic shift.  ">>" rounds toward negative
+       * infinity, so on the negative side the filter sticks: with
+       * smooth=-1, raw=0 the shift gives (-3)>>2 == -1 forever, while
+       * /4 gives 0 and lets the value settle back to center.
+       * Truncating division is symmetric about zero.
+       */
+
+      smooth = (smooth * TRACK_EMA_WEIGHT + raw_dx)
+               / (TRACK_EMA_WEIGHT + 1);
+
+      /* Per-side auto-range: each direction is normalised by its own
+       * tracked peak, so both sides reach full pupil travel even if the
+       * camera framing makes one side read larger.  Expand to new peaks
+       * instantly, decay slowly toward the floor.
+       */
+
+      if (smooth >= 0)
+        {
+          if (smooth > dx_span_pos)
+            {
+              dx_span_pos = smooth;
+            }
+          else
+            {
+              dx_span_pos = (dx_span_pos * 63 +
+                             TRACK_SPAN_MIN) / 64;
+            }
+
+          new_gaze = smooth * TRACK_GAZE_MAX / dx_span_pos;
+        }
+      else
+        {
+          int m = -smooth;
+
+          if (m > dx_span_neg)
+            {
+              dx_span_neg = m;
+            }
+          else
+            {
+              dx_span_neg = (dx_span_neg * 63 +
+                             TRACK_SPAN_MIN) / 64;
+            }
+
+          new_gaze = smooth * TRACK_GAZE_MAX / dx_span_neg;
+        }
+
+      /* Clamp */
+
+      if (new_gaze < -TRACK_GAZE_MAX)
+        {
+          new_gaze = -TRACK_GAZE_MAX;
+        }
+
+      if (new_gaze > TRACK_GAZE_MAX)
+        {
+          new_gaze = TRACK_GAZE_MAX;
+        }
+
+      /* Dead zone: skip redraw if movement < 2 pixels */
+
+      if (new_gaze != last_gaze &&
+          abs(new_gaze - last_gaze) >= 3)
+        {
+          up_disable_irq(BK7258_IRQ_YUV_BUF);
+          bk7258_lcd_eye_gaze(0, last_gaze, new_gaze);
+          bk7258_lcd_eye_gaze(1, last_gaze, new_gaze);
+          up_enable_irq(BK7258_IRQ_YUV_BUF);
+          last_gaze = new_gaze;
+        }
+
+      /* Periodic status line */
+
+      if (captured % 10 == 0 || (!continuous && captured == n_frames))
+        {
+          /* raw_dx is the post-invert value actually fed to the EMA;
+           * printing dir.dx would hide the effect of invert.  total is
+           * printed next to blob so a MISS can be attributed to either
+           * the skin-tone gate or the blob extraction stage.
+           */
+
+          char dstr[12];
+          if (continuous) snprintf(dstr, sizeof(dstr), "cont");
+          else snprintf(dstr, sizeof(dstr), "%d", n_frames);
+
+          printf("[track] %d/%s  raw=%+d  smooth=%+d "
+                 "gaze=%+d  blob=%lu  total=%lu  cr>=%d  %s\n",
+                 captured, dstr,
+                 raw_dx,
+                 smooth, new_gaze,
+                 (unsigned long)dir.blob_hits,
+                 (unsigned long)dir.total_hits,
+                 dir.cr_lo,
+                 dir.valid ? "OK" : "MISS");
+        }
+    }
+
+  if (continuous)
+    {
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+    }
+
+  /* Return eyes to center */
+
+  if (last_gaze != 0)
+    {
+      up_disable_irq(BK7258_IRQ_YUV_BUF);
+      bk7258_lcd_eye_gaze(0, last_gaze, 0);
+      bk7258_lcd_eye_gaze(1, last_gaze, 0);
+      up_enable_irq(BK7258_IRQ_YUV_BUF);
+    }
+
+  ret = captured > 0 ? 0 : -EIO;
+
+stop_lcd:
+  bk7258_lcd_preview_deinit();
+
+stop_stream:
+  g_stream_active = false;
+  dvp_irq_detach();
+  dvp_ctrl_deconfig();
+
+  syslog(LOG_INFO,
+         "[track] done: captured=%d  "
+         "pingpong=%lu  drop=%lu\n",
+         captured,
+         (unsigned long)g_pingpong_count,
+         (unsigned long)g_drop_count);
+
+  return ret;
+
+cleanup_irq:
+  dvp_irq_detach();
+cleanup_ctrl:
+  dvp_ctrl_deconfig();
+  return ret;
+}
+
+/****************************************************************************
  * DEBUG_JOURNAL - GC2145/DVP Hardware Notes
  ****************************************************************************
  *
@@ -4261,28 +5828,36 @@ int bk7258_camera_testpat(void)
  *   sys_reserver_reg0xd at 0x44010034, bit[9] = cis_auxs_cken.
  *
  * Frame buffers:
- *   YUYV 640x480 = 614400 bytes per frame, two buffers in PSRAM at
- *   0x60000000.  DVP DMA needs 32/64-byte alignment, which plain
- *   mm_malloc cannot guarantee - this is why bk7258_psram_memalign()
+ *   640x480, 2 bytes/pixel = 614400 bytes per frame, two buffers in
+ *   PSRAM at 0x60000000.  DVP DMA needs 32/64-byte alignment, which
+ *   plain mm_malloc cannot guarantee - this is why bk7258_psram_memalign()
  *   was added during the PSRAM S4 stage (see markdown section 22.12).
  *   Preview scratch buffer at 0x6012C000, 160x160x2 = 51200 bytes.
  *
  * ========================================================================
- * Pixel Format: UYVY, not YUYV
+ * Pixel Format: VYUY, not UYVY
  * ========================================================================
  *
- * GC2145 register 0x84 = 0x02 produces UYVY.  ARMino's dvp_gc2145.c
- * annotates this value as "yuyv", which is wrong.  Verified by dumping
- * PSRAM after a capture: the actual byte order is U Y0 V Y1.
+ * GC2145 register 0x84 = 0x02.  The actual PSRAM byte order is
+ * V Y0 U Y1, i.e. byte0 = Cr(V), byte1 = Y0, byte2 = Cb(U), byte3 = Y1.
  *
- * Getting this backwards does not produce garbage - it produces a
- * plausible-looking but wrongly-tinted image, which is why it survived
- * several debugging rounds.  The symptom that finally exposed it was
- * colour channels swapping when the sampling offset shifted by one byte.
+ * History:
+ *   1. ARMino's dvp_gc2145.c labels reg 0x84=0x02 as "yuyv".
+ *   2. First verification (memory dump on grey scene) concluded "UYVY"
+ *      because byte0 and byte2 were both ~0x80 and indistinguishable.
+ *   3. Second verification (pure-red / pure-blue color targets, 2026-08-21)
+ *      proved byte0 = Cr, byte2 = Cb, i.e. VYUY.
  *
- * Identifier naming in this file still says YUYV in places because it
- * tracks the ARMino register table it was ported from; the runtime
- * conversion path (uyvy_to_rgb565_scaled) uses the correct order.
+ * Lesson: a memory dump can show WHICH bytes carry chroma, but on a
+ * symmetric scene (grey, where Cb~Cr~128) it cannot distinguish the
+ * two.  Order requires a scene that breaks symmetry — pure red or
+ * pure blue — so the two chroma channels have different values.
+ *
+ * Getting this backwards does not produce garbage — it produces a
+ * plausible-looking but wrongly-tinted image (skin turns green/purple).
+ *
+ * Identifier naming in this file still says YUYV/UYVY in places because
+ * it tracks the ARMino register table it was ported from.
  *
  * ========================================================================
  * Ping-Pong Buffer Ownership

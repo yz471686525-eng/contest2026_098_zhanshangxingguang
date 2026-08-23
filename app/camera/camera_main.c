@@ -52,6 +52,12 @@ int main(int argc, char *argv[])
       printf("  preview [n] — capture + LCD display (default 100)\n");
       printf("  testpat — color bars to LCD (no camera, tests blit)\n");
       printf("  bench  — PSRAM vs SRAM conversion timing (A/B test)\n");
+      printf("  uvhist [n] [lo] [hi] — UV+Y histogram"
+             " (zoom: 32 buckets in [lo,hi])\n");
+      printf("  detect [n] — skin-tone direction"
+             " (default 1 frame)\n");
+      printf("  track [n] [inv] — skin gaze tracking"
+             " (n=100 default, n=0 continuous, inv=1/0)\n");
       return 1;
     }
 
@@ -108,6 +114,30 @@ int main(int argc, char *argv[])
   else if (strcmp(argv[1], "bench") == 0)
     {
       return bk7258_camera_bench();
+    }
+  else if (strcmp(argv[1], "uvhist") == 0)
+    {
+      int n = 1;
+      int lo = -1;
+      int hi = -1;
+      if (argc >= 3) n = atoi(argv[2]);
+      if (argc >= 4) lo = atoi(argv[3]);
+      if (argc >= 5) hi = atoi(argv[4]);
+      return bk7258_camera_uvhist(n, lo, hi);
+    }
+  else if (strcmp(argv[1], "detect") == 0)
+    {
+      int n = 1;
+      if (argc >= 3) n = atoi(argv[2]);
+      return bk7258_camera_detect(n);
+    }
+  else if (strcmp(argv[1], "track") == 0)
+    {
+      int n = 100;
+      int inv = 1;  /* default: mirror-correct "look toward you" */
+      if (argc >= 3) n = atoi(argv[2]);
+      if (argc >= 4) inv = atoi(argv[3]);
+      return bk7258_camera_track(n, inv);
     }
   else
     {

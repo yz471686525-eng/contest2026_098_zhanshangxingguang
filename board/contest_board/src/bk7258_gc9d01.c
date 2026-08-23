@@ -147,7 +147,7 @@ static gpio_cache_t g_cache_dc;
 
 #define spi_delay() \
   do { \
-    __asm__ volatile("nop; nop; nop; nop;"); \
+    __asm__ volatile("nop; nop;"); \
   } while (0)
 
 /****************************************************************************
@@ -268,7 +268,8 @@ static uint32_t g_spi_max_chunk = SPI_MAX_CHUNK_BYTES;
  *   div=0  (26 MHz)  →  50ms / 1000 KB/s (no gain, polling ceiling)
  */
 
-static uint32_t g_spi_clk_div = CONFIG_LCD_GC9D01_SPI_CLK_DIV;
+static uint32_t g_spi_clk_div = 3;   /* was CONFIG (1); 6.5MHz for
+                                       * signal integrity under load */
 
 /* Runtime-adjustable SPI burst write count.
  * Default = CONFIG_LCD_GC9D01_SPI_BURST (from Kconfig, default 32).
@@ -1550,11 +1551,17 @@ static void lcd_setup_pins(const lcd_pins_t *pins)
   gpio_write_fast(&g_cache_mosi, 0);
 
 #ifdef CONFIG_LCD_GC9D01_HW_SPI
-  /* Initialize SPI1 for left screen.  Pins stay in GPIO mode until
-   * data transfer time.  Failure is non-fatal — falls back to bit-bang.
+  /* Initialize SPI1 for left screen — ONCE.  The SPI1 peripheral config
+   * (clock, CTRL, reset) persists across panel switches; the right panel
+   * bit-bangs its own pins (P22-24) and never touches SPI1.  Re-running
+   * the full init on every panel switch (i.e. every eye redraw) was the
+   * source of the per-frame "[lcd] SPI1 init OK" spam and frame drops.
+   * lcd_spi_deinit() clears g_hw_spi_capable, so the next session
+   * re-inits once.  Pins stay GPIO until transfer time (lcd_spi_write
+   * mux's them per write).  Failure is non-fatal — falls back to bit-bang.
    */
 
-  if (pins->sclk == 2)
+  if (pins->sclk == 2 && !g_hw_spi_capable)
     {
       int ret = lcd_spi_init(pins);
 
@@ -1572,9 +1579,10 @@ static void lcd_setup_pins(const lcd_pins_t *pins)
  *
  * Description:
  *   Bit-bang one byte, MSB-first, SPI mode 0.
- *   Uses cached GPIO values (no getreg32 read) and no NOP delay.
- *   GC9D01 can handle fast SPI clock; add back one spi_delay() if
- *   display shows corruption.
+ *   Uses cached GPIO values (no getreg32 read).
+ *   spi_delay() after each SCLK edge adds timing margin that
+ *   prevents window corruption when PSRAM/DVP bus traffic
+ *   stalls the CPU mid-transfer.
  *
  ****************************************************************************/
 
@@ -1586,7 +1594,9 @@ static void spi_write_byte(uint8_t byte)
     {
       gpio_write_fast(&g_cache_mosi, (byte >> bit) & 1);
       gpio_write_fast(&g_cache_sclk, 1);
+      spi_delay();
       gpio_write_fast(&g_cache_sclk, 0);
+      spi_delay();
     }
 }
 
@@ -2281,35 +2291,162 @@ static void eye_draw_full(int gaze_dx)
  * Name: eye_move_pupil
  *
  * Description:
- *   Local update: repaint old pupil position with iris colour, then
- *   draw pupil + highlight at the new position.  No full-screen fill.
+ *   Stream-based local update: composite one bounding-box region into
+ *   a RAM buffer (highlight > pupil > iris > background), then blast
+ *   it to the LCD in a single CASET/RASET/RAMWR sequence.
+ *   Eliminates the per-circle command storm that caused horizontal
+ *   tearing when DVP interrupts preempted mid-draw.
  *
  ****************************************************************************/
 
 static void eye_move_pupil(int old_dx, int new_dx)
 {
+  static uint8_t buf[128 * 52 * 2];
   int old_cx = EYE_CX + old_dx;
   int new_cx = EYE_CX + new_dx;
+  int hx = new_cx - 8;
+  int hy = EYE_CY - 10;
+  int x0;
+  int x1;
+  int y0;
+  int y1;
+  int w;
+  int h;
+  int x;
+  int y;
+  int idx;
+  uint8_t ca[4];
+  uint8_t ra[4];
 
-  syslog(LOG_INFO,
-         "[eye] move pupil %d -> %d\n", old_dx, new_dx);
+  /* Bounding box covering old + new pupil + highlight, with 2px pad */
 
-  /* Erase old pupil (r23 to catch anti-aliased edge) */
+  x0 = (old_cx < new_cx ? old_cx : new_cx) - EYE_PUPIL_R - 2;
+  x1 = (old_cx > new_cx ? old_cx : new_cx) + EYE_PUPIL_R + 2;
+  y0 = EYE_CY - EYE_PUPIL_R - 2;
+  y1 = EYE_CY + EYE_PUPIL_R + 2;
 
-  lcd_fill_circle(old_cx, EYE_CY, 23, 0x07ff);
+  /* Clamp to iris circle and screen bounds */
 
-  /* Erase old highlight (extends beyond pupil r22) */
+  if (x0 < EYE_CX - EYE_IRIS_R) x0 = EYE_CX - EYE_IRIS_R;
+  if (x1 > EYE_CX + EYE_IRIS_R) x1 = EYE_CX + EYE_IRIS_R;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > LCD_WIDTH  - 1) x1 = LCD_WIDTH  - 1;
+  if (y1 > LCD_HEIGHT - 1) y1 = LCD_HEIGHT - 1;
 
-  lcd_fill_circle(old_cx - 8, EYE_CY - 10, 10, 0x07ff);
+  w = x1 - x0 + 1;
+  h = y1 - y0 + 1;
+  if (w <= 0 || h <= 0 || w * h * 2 > (int)sizeof(buf)) return;
 
-  /* Black pupil at new position */
+  /* Per-pixel composite: highlight(white) > pupil(black) >
+   * iris(cyan) > background(black)
+   */
 
-  lcd_fill_circle(new_cx, EYE_CY, EYE_PUPIL_R, 0x0000);
+  idx = 0;
+  for (y = y0; y <= y1; y++)
+    {
+      int dyp = y - EYE_CY;
+      int dyh = y - hy;
 
-  /* White highlight */
+      for (x = x0; x <= x1; x++)
+        {
+          int dxp = x - new_cx;
+          int dxh = x - hx;
+          int dxi = x - EYE_CX;
+          int dyi = y - EYE_CY;
+          uint16_t c;
 
-  lcd_fill_circle(new_cx - 8, EYE_CY - 10,
-                  EYE_HIGHLIGHT_R, 0xffff);
+          if (dxh * dxh + dyh * dyh <=
+              EYE_HIGHLIGHT_R * EYE_HIGHLIGHT_R)
+            {
+              c = 0xffff;
+            }
+          else if (dxp * dxp + dyp * dyp <=
+                   EYE_PUPIL_R * EYE_PUPIL_R)
+            {
+              c = 0x0000;
+            }
+          else if (dxi * dxi + dyi * dyi <=
+                   EYE_IRIS_R * EYE_IRIS_R)
+            {
+              c = 0x07ff;
+            }
+          else
+            {
+              c = 0x0000;
+            }
+
+          buf[idx++] = (uint8_t)((c >> 8) & 0xff);
+          buf[idx++] = (uint8_t)(c & 0xff);
+        }
+    }
+
+  /* Single window open + one data stream, no per-row commands */
+
+  ca[0] = (uint8_t)((x0 >> 8) & 0xff);
+  ca[1] = (uint8_t)(x0 & 0xff);
+  ca[2] = (uint8_t)((x1 >> 8) & 0xff);
+  ca[3] = (uint8_t)(x1 & 0xff);
+  lcd_send_cmd_data(0x2a, ca, 4);
+
+  ra[0] = (uint8_t)((y0 >> 8) & 0xff);
+  ra[1] = (uint8_t)(y0 & 0xff);
+  ra[2] = (uint8_t)((y1 >> 8) & 0xff);
+  ra[3] = (uint8_t)(y1 & 0xff);
+  lcd_send_cmd_data(0x2b, ra, 4);
+
+  lcd_send_cmd(0x2c);
+  lcd_send_data(buf, w * h * 2);
+}
+
+/****************************************************************************
+ * Name: bk7258_lcd_eye_draw
+ *
+ * Description:
+ *   Full draw of the animated eye on the specified panel.
+ *   Wrapper that handles panel switching, then calls eye_draw_full().
+ *
+ ****************************************************************************/
+
+void bk7258_lcd_eye_draw(int panel, int gaze_dx)
+{
+  if (panel == 1 && g_active_pins != &g_lcd_right)
+    {
+      lcd_set_pins(&g_lcd_right);
+      lcd_setup_pins(&g_lcd_right);
+    }
+  else if (panel != 1 && g_active_pins != &g_lcd_left)
+    {
+      lcd_set_pins(&g_lcd_left);
+      lcd_setup_pins(&g_lcd_left);
+    }
+
+  eye_draw_full(gaze_dx);
+}
+
+/****************************************************************************
+ * Name: bk7258_lcd_eye_gaze
+ *
+ * Description:
+ *   Local refresh: move pupil from old_dx to new_dx on the specified panel.
+ *   Wrapper that handles panel switching, then calls eye_move_pupil().
+ *
+ ****************************************************************************/
+
+void bk7258_lcd_eye_gaze(int panel, int old_dx, int new_dx)
+{
+  if (panel == 1 && g_active_pins != &g_lcd_right)
+    {
+      lcd_set_pins(&g_lcd_right);
+      lcd_setup_pins(&g_lcd_right);
+    }
+  else if (panel != 1 && g_active_pins != &g_lcd_left)
+    {
+      lcd_set_pins(&g_lcd_left);
+      lcd_setup_pins(&g_lcd_left);
+    }
+
+  eye_move_pupil(old_dx, new_dx);
 }
 
 /****************************************************************************

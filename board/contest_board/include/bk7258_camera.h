@@ -63,7 +63,7 @@ int bk7258_camera_io(void);
  *
  * Description:
  *   Phase 1 Step 2: power on, MCLK, reset, read chip ID, write GC2145
- *   init table (YUYV 640x480), readback verify.
+ *   init table (640x480), readback verify.
  *   MCLK and power are left ON after success (for oscilloscope verify).
  *
  * Returns:
@@ -156,11 +156,16 @@ int bk7258_camera_preview(int n_frames, int panel);
 int bk7258_camera_dump(void);
 int bk7258_camera_testpat(void);
 int bk7258_camera_bench(void);
+int bk7258_camera_uvhist(int n_frames, int zoom_lo, int zoom_hi);
+int bk7258_camera_detect(int n_frames);
+int bk7258_camera_track(int n_frames, int invert);
 
 void bk7258_lcd_blit_rgb565(int panel,
                              uint16_t x0, uint16_t y0,
                              uint16_t w, uint16_t h,
                              const uint8_t *rgb565);
+void bk7258_lcd_eye_draw(int panel, int gaze_dx);
+void bk7258_lcd_eye_gaze(int panel, int old_dx, int new_dx);
 int bk7258_lcd_preview_init(void);
 void bk7258_lcd_preview_deinit(void);
 
